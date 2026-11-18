@@ -654,6 +654,19 @@ export default function TextToSpeech({
           rows={1}
         />
 
+        {/* Emoji direction only exists for the Polish Piper voices */}
+        {String(selectedVoice || "").startsWith("pl_") && (
+          <div className="voice-directive-hint" title="Emoji direction">
+            <span>📖 chapter</span>
+            <span>🛑 900 ms</span>
+            <span>⏸️ 400 ms</span>
+            <span>🐢 slower</span>
+            <span>🐇 faster</span>
+            <span>🎙️ narrator</span>
+            <span>📻 📱 🏛️ 🤫 plan</span>
+          </div>
+        )}
+
         <div className="chat-composer-toolbar">
           <div className="chat-composer-toolbar-left">
             <div ref={voiceMenuRef} className="voice-anchor">

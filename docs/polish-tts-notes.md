@@ -79,13 +79,15 @@ Pozostałe:
 - **MC Speech** — równy, neutralny głos, ale bez charakteru; przydatny jako zapas.
 - **MLS 6892** — najsłabszy: 16 kHz i jakość `low`, słyszalne szumy i mniejsze
   opanowanie polskich końcówek. Nadaje się tylko do szybkich prób.
-- **Interpunkcja i akcent zdaniowy** — Piper czyta poprawnie, ale prozodia jest płaska:
+- **Interpunkcja i akcent zdaniowy** — Piper czyta poprawnie (pauzy i tempo można już
+  ustawiać emoji), ale prozodia sama w sobie jest płaska:
   brak akcentowania emocji, pytania brzmią jak twierdzenia. Da się to łagodzić
   przecinkami i krótszymi zdaniami, nie da się ustawić „na życzenie".
 
 ## 5. Co nie działa / zostało odrzucone
 
-- **Brak normalizacji tekstu przed syntezą.** Studio nie ma etapu normalizacji, więc
+- **Brak normalizacji tekstu przed syntezą (naprawione).** Przed Piperem działa teraz
+  polski verbalizer, ale wcześniej studio nie miało żadnego etapu normalizacji, więc
   liczby, daty, skróty („np.", „itd.", „2026 r.") i symbole są czytane dosłownie albo
   przekręcane. To największa pojedyncza wada obecnego lektora — do nadrobienia
   osobnym krokiem (normalizator tekstu), nie zmianą głosu.
@@ -105,10 +107,61 @@ Pozostałe:
 - **OpenVoice nie naprawia wymowy** — zmienia tylko barwę. Jeśli Piper źle przeczyta
   słowo, `pl_george` przeczyta je tak samo źle.
 
-## 6. Otwarte tematy
+## 6. Reżyseria emoji, verbalizer, cache i plany akustyczne
 
-1. Normalizacja tekstu (liczby, daty, skróty) przed Piperem — największy zysk jakości.
+Zaimplementowane w `scripts/server/tts-directives.cjs` i podłączone do trasy
+`POST /api/tts/speak` dla głosów polskich (Piper i `voiceconv`).
+
+**Gramatyka (wklejana w tekst):**
+
+| Znacznik | Efekt |
+|---|---|
+| `📖` | początek rozdziału: pauza 900 ms + wpis w metadanych (`chapters[]` z `startMs`/`endMs`) |
+| `🛑` | pauza 900 ms |
+| `⏸️` | pauza 400 ms |
+| `😮‍💨` | pauza 600 ms (na razie cisza, nie proceduralny oddech) |
+| `🐢` | tempo ×0,85 (kumuluje się, minimum 0,5) |
+| `🐇` | tempo ×1,15 (maksimum 2) |
+| `🎙️` | powrót do narratora: tempo 1, brak planu akustycznego |
+| `📻` / `📱` / `🏛️` / `🤫` | plan akustyczny: radio / telefon / katedra / szept (ffmpeg) |
+
+Emoji spoza gramatyki są usuwane, a nie czytane na głos. Kokoro nie ma reżyserii: znaczniki są z niego po prostu wycinane.
+
+**Polski verbalizer** (zawsze dla głosów PL, także bez emoji): liczby z odmianą
+(„152” → „sto pięćdziesiąt dwa”), tysiące, ułamki („3,5” → „trzy przecinek pięć”),
+daty („24.02.2024” → „dwudziestego czwartego lutego dwa tysiące dwudziestego
+czwartego roku”), godziny („15:47” → „piętnasta czterdzieści siedem”, po „o” →
+„o piętnastej czterdzieści siedem”), kwoty („199,99 zł” → „sto dziewięćdziesiąt
+dziewięć złotych dziewięćdziesiąt dziewięć groszy”), procenty, rzeczowniki
+policzalne („22 szt.” → „dwadzieścia dwie sztuki”) oraz skróty (`np.`, `itd.`,
+`m.in.`, `r.`, `szt.`, `os.`, `km`, `kg`…).
+
+**Cache zdań:** każdy wyrenderowany segment trafia do `app/tts-cache/segments/`
+pod kluczem SHA-256 z (głos, tempo, plan DSP, tekst, próbkowanie). Zmiana jednego
+zdania nie renderuje reszty. Pomiar na tym samym skrypcie: pierwsze renderowanie
+5 segmentów / 14,7 s audio = 5,6 s, powtórka = 18 ms (5/5 segmentów z cache).
+
+**Plany akustyczne (ffmpeg):**
+
+| Plan | Łańcuch filtrów |
+|---|---|
+| `📻` radio | `highpass 250, lowpass 3200, acompressor, volume 1.1` |
+| `📱` telefon | `highpass 300, lowpass 3400, acompressor` |
+| `🏛️` katedra | `aecho 60/110 ms, lowpass 6000` |
+| `🤫` szept | `highpass 180, lowpass 5000, volume 0.55` |
+
+Weryfikacja pomiarem (to samo zdanie, ten sam głos, ZCR): czysty 2248 Hz,
+radio 2376 Hz (kompresor podnosi głośność), telefon 1536 Hz — czyli filtr
+dolnoprzepustowy faktycznie działa. Brzmienia nie ocenialiśmy słuchem.
+
+## 7. Otwarte tematy
+
+1. ~~Normalizacja tekstu (liczby, daty, skróty) przed Piperem~~ — zrobione w verbalizerze;
+   zostały rzadsze przypadki (rzymskie, zakresy liczbowe, obce nazwy).
 2. Ewentualne porównanie Chatterbox vs LFM3-Omni, jeśli któryś da się uruchomić
    bez wymiany backendu.
 3. `mc_speech` i `mls_6892` nie mają w model card informacji o płci mówcy — w UI
    pokazują się bez etykiety płci (celowo, zamiast zgadywania).
+4. Klonowanie z własnej próbki (VoiceLab): dziś `referenceFile` jest zaszyty w kodzie;
+   brakuje wgrywania referencji z UI i pomiaru jakości próbki.
+5. Rozdziały są w metadanych nagrania, ale zakładka Voice jeszcze ich nie pokazuje.

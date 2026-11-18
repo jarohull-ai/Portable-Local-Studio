@@ -12,6 +12,17 @@ const path     = require("path");
 const { spawn, spawnSync, execSync, exec, execFile } = require("child_process");
 const { comprehensiveWebSearch } = require("../search/core");
 const { detectModelKindCached } = require("./model-kind.cjs");
+const {
+  applyDspPreset,
+  hasDirectives,
+  joinSegments,
+  parseDirectedText,
+  pcm16FromWav,
+  preparePlainText,
+  resolveFfmpeg,
+  segmentCacheKey,
+  stripDirectives,
+} = require("./tts-directives.cjs");
 
 // HTTP keep-alive agent for llama-server (eliminates TCP handshake per request)
 const llmHttpAgent = new http.Agent({
@@ -2763,6 +2774,9 @@ function saveTtsOutput(result) {
     displayName: result.displayName || `${result.voiceName || result.voice} - ${createdAt}`,
     // Where each sentence starts and ends in the audio, for word highlighting during playback
     ...(Array.isArray(result.segments) && result.segments.length ? { segments: result.segments } : {}),
+    // Chapter marks and emoji direction, when the script used them
+    ...(Array.isArray(result.chapters) && result.chapters.length ? { chapters: result.chapters } : {}),
+    ...(Number(result.directiveCount) ? { directiveCount: Number(result.directiveCount) } : {}),
   };
   fs.writeFileSync(path.join(TTS_OUTPUTS, jsonFilename), JSON.stringify(metadata, null, 2), "utf8");
   return {
@@ -2810,7 +2824,7 @@ function listTtsOutputs() {
 
 function synthesizeTts(text, options = {}) {
   return new Promise((resolve, reject) => {
-    const cleanedText = String(text || "").trim();
+    let cleanedText = String(text || "").trim();
     if (!cleanedText) {
       reject(new Error("Enter text to synthesize."));
       return;
@@ -2820,13 +2834,23 @@ function synthesizeTts(text, options = {}) {
       return;
     }
     const requestedVoice = String(options.voice || ttsSettings.voice || "af_heart");
-    if (isVoiceCloneVoice(requestedVoice)) {
-      synthesizeVoiceCloneTts(cleanedText, { ...options, voice: requestedVoice }).then(resolve, reject);
+    if (isVoiceCloneVoice(requestedVoice) || isPiperVoice(requestedVoice)) {
+      // Polish engines: emoji direction, and numbers read as words rather than digits.
+      if (hasDirectives(cleanedText)) {
+        synthesizeDirectedTts(cleanedText, { ...options, voice: requestedVoice }).then(resolve, reject);
+        return;
+      }
+      const prepared = preparePlainText(cleanedText, { polish: true }) || cleanedText;
+      if (isVoiceCloneVoice(requestedVoice)) {
+        synthesizeVoiceCloneTts(prepared, { ...options, voice: requestedVoice }).then(resolve, reject);
+        return;
+      }
+      synthesizePiperTts(prepared, { ...options, voice: requestedVoice }).then(resolve, reject);
       return;
     }
-    if (isPiperVoice(requestedVoice)) {
-      synthesizePiperTts(cleanedText, { ...options, voice: requestedVoice }).then(resolve, reject);
-      return;
+    // Kokoro has no directive support: drop the markers instead of speaking them.
+    if (hasDirectives(cleanedText)) {
+      cleanedText = stripDirectives(cleanedText).replace(/\s+/g, " ").trim() || cleanedText;
     }
     const runtime = getTtsRuntimeStatus();
     if (!runtime.installed) {
@@ -2999,7 +3023,7 @@ function runVoiceConversion({ sourceWav, referenceWav, outPath, tau = 0.3 }) {
   });
 }
 
-function saveSynthesizedWav({ text, wavPath, voiceId, voiceName, modelFile, modelName, speed, startedAt }) {
+function saveSynthesizedWav({ text, wavPath, voiceId, voiceName, modelFile, modelName, speed, startedAt, chapters, directiveCount }) {
   const info = readWavInfo(fs.readFileSync(wavPath));
   return saveTtsOutput({
     text,
@@ -3011,6 +3035,8 @@ function saveSynthesizedWav({ text, wavPath, voiceId, voiceName, modelFile, mode
     durationMs: info?.durationMs || Date.now() - startedAt,
     sampleRate: info?.sampleRate || 22050,
     wavPath,
+    chapters,
+    directiveCount,
     displayName: `${voiceName} - ${text.slice(0, 40)}`,
   });
 }
@@ -3118,6 +3144,163 @@ function synthesizeVoiceCloneTts(text, options = {}) {
       ttsError = err.message || String(err);
       throw err;
     });
+}
+
+// --- Directed speech (emoji script + sentence cache + DSP) --------------------
+// Rendering one segment at a time is what makes the direction possible at all:
+// tempo, acoustic plan and pauses only exist per segment. Each rendered segment
+// is cached by (voice, speed, dsp, text), so re-rendering a chapter only pays for
+// the sentences that actually changed.
+
+const DIRECTIVE_SEGMENT_CACHE = path.join(TTS_CACHE, "segments");
+let ffmpegPathCache = null;
+
+function getFfmpegPath() {
+  if (ffmpegPathCache === null) ffmpegPathCache = resolveFfmpeg();
+  return ffmpegPathCache;
+}
+
+function readPiperSampleRate(voice) {
+  try {
+    const manifest = JSON.parse(fs.readFileSync(`${voice.model}.json`, "utf8"));
+    const rate = Number(manifest?.audio?.sample_rate);
+    if (rate) return rate;
+  } catch (_) {}
+  return 22050;
+}
+
+function getDirectedVoice(voiceId) {
+  if (isVoiceCloneVoice(voiceId)) {
+    const voice = getVoiceCloneVoice(voiceId);
+    return { voice, base: getPiperVoice(voice.baseVoice), kind: "voiceconv" };
+  }
+  const voice = getPiperVoice(voiceId);
+  return { voice, base: voice, kind: "piper" };
+}
+
+async function renderDirectedSegment({ directedVoice, segment, sampleRate, stamp, index }) {
+  const cacheKey = segmentCacheKey({
+    voice: directedVoice.voice.id,
+    speed: segment.speed,
+    dsp: segment.dsp,
+    text: segment.text,
+    sampleRate,
+  });
+  const cachedPath = path.join(DIRECTIVE_SEGMENT_CACHE, `${cacheKey}.wav`);
+  if (fs.existsSync(cachedPath)) return { path: cachedPath, cached: true };
+  if (segment.dsp && !getFfmpegPath()) {
+    throw new Error("ffmpeg is required for acoustic plans (📻 📱 🏛️ 🤫). Install it or remove the emoji.");
+  }
+
+  const rawPath = path.join(TTS_OUTPUTS, `.tts-seg-${stamp}-${index}.wav`);
+  const convertedPath = path.join(TTS_OUTPUTS, `.tts-seg-vc-${stamp}-${index}.wav`);
+  const filteredPath = path.join(TTS_OUTPUTS, `.tts-seg-dsp-${stamp}-${index}.wav`);
+  try {
+    await runPiperToWav(directedVoice.base, segment.text, segment.speed, rawPath);
+    let sourcePath = rawPath;
+    if (directedVoice.kind === "voiceconv") {
+      await runVoiceConversion({ sourceWav: rawPath, referenceWav: directedVoice.voice.referenceWav, outPath: convertedPath });
+      sourcePath = convertedPath;
+    }
+    if (segment.dsp) {
+      await applyDspPreset({
+        inputPath: sourcePath,
+        outputPath: filteredPath,
+        preset: segment.dsp,
+        sampleRate,
+        ffmpegPath: getFfmpegPath(),
+      });
+      sourcePath = filteredPath;
+    }
+    fs.mkdirSync(DIRECTIVE_SEGMENT_CACHE, { recursive: true });
+    fs.copyFileSync(sourcePath, cachedPath);
+    return { path: cachedPath, cached: false };
+  } finally {
+    for (const file of [rawPath, convertedPath, filteredPath]) {
+      try { fs.unlinkSync(file); } catch (_) {}
+    }
+  }
+}
+
+async function synthesizeDirectedTts(text, options = {}) {
+  const directedVoice = getDirectedVoice(options.voice);
+  const sampleRate = readPiperSampleRate(directedVoice.base);
+  const plan = parseDirectedText(text, { polish: true });
+  if (!plan.segments.length) throw new Error("Enter text to synthesize.");
+
+  const stamp = new Date().toISOString().replace(/[:.]/g, "-");
+  const startedAt = Date.now();
+  ttsGenerationState = {
+    active: true,
+    phase: "Generating speech",
+    progress: 0,
+    done: 0,
+    total: plan.segments.length,
+    startedAt,
+    model: directedVoice.base.voiceFile,
+    voice: directedVoice.voice.id,
+    output: "",
+  };
+
+  const parts = [];
+  const segmentStarts = [];
+  let cursorMs = plan.leadingPauseMs;
+  let cachedSegments = 0;
+  try {
+    for (let index = 0; index < plan.segments.length; index += 1) {
+      const segment = plan.segments[index];
+      ttsGenerationState = {
+        ...ttsGenerationState,
+        done: index,
+        progress: Math.min(99, Math.round((index / plan.segments.length) * 100)),
+      };
+      const rendered = await renderDirectedSegment({ directedVoice, segment, sampleRate, stamp, index });
+      if (rendered.cached) cachedSegments += 1;
+      const wavBuffer = fs.readFileSync(rendered.path);
+      const pcm = pcm16FromWav(wavBuffer);
+      if (!pcm) throw new Error("A rendered segment was not mono 16-bit PCM audio.");
+      if (pcm.sampleRate !== sampleRate) {
+        throw new Error(`Cannot join audio at ${pcm.sampleRate} Hz with ${sampleRate} Hz.`);
+      }
+      segmentStarts[index] = cursorMs;
+      parts.push({ pcm: pcm.pcm, pauseMs: segment.pauseMs });
+      cursorMs += Math.round((pcm.pcm.length / 2 / sampleRate) * 1000) + segment.pauseMs;
+    }
+
+    const wav = joinSegments(parts, { sampleRate, leadingPauseMs: plan.leadingPauseMs });
+    const outPath = path.join(TTS_OUTPUTS, `.tts-directed-${stamp}.wav`);
+    fs.writeFileSync(outPath, wav);
+
+    const chapters = plan.chapters.map((chapter, position) => {
+      const next = plan.chapters[position + 1];
+      const startMs = segmentStarts[chapter.index] ?? cursorMs;
+      const endMs = next ? (segmentStarts[next.index] ?? cursorMs) : cursorMs;
+      return { title: chapter.title, startMs, endMs: Math.max(startMs, endMs) };
+    });
+
+    const saved = saveSynthesizedWav({
+      text: plan.text,
+      wavPath: outPath,
+      voiceId: directedVoice.voice.id,
+      voiceName: directedVoice.voice.name,
+      modelFile: directedVoice.base.voiceFile,
+      modelName: directedVoice.kind === "voiceconv"
+        ? `Piper ${directedVoice.base.name} + OpenVoice (${directedVoice.voice.name})`
+        : `Piper ${directedVoice.base.name}`,
+      speed: Number(options.speed) || 1,
+      startedAt,
+      chapters,
+      directiveCount: plan.directives.length,
+    });
+    try { fs.unlinkSync(outPath); } catch (_) {}
+    ttsGenerationState = { active: false, phase: "Complete", progress: 100, model: directedVoice.base.voiceFile, voice: directedVoice.voice.id, output: saved.audioFile || "" };
+    ttsError = null;
+    return { ...saved, segments: plan.segments.length, cachedSegments };
+  } catch (err) {
+    ttsGenerationState = { active: false, phase: "Failed", progress: 0, model: directedVoice.base.voiceFile, voice: directedVoice.voice.id, output: "" };
+    ttsError = err.message || String(err);
+    throw err;
+  }
 }
 
 function runExclusiveSpeechOperation(operation) {

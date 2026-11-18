@@ -159,6 +159,40 @@ function findWordIndex(timeline, time) {
 const PLAYBACK_RATES = [0.5, 0.75, 1, 1.25, 1.5, 1.75, 2];
 const PLAYER_PREFS_KEY = "voicePlayerPrefs";
 
+// Emoji direction for the Polish voices. One click puts the marker at the caret
+// with the spacing already right, and a chapter marker always starts a new line.
+const DIRECTIVE_PALETTE = [
+  {
+    group: "Structure",
+    items: [{ token: "📖", label: "Chapter", hint: "new chapter, 900 ms pause" }],
+  },
+  {
+    group: "Pauses",
+    items: [
+      { token: "🛑", label: "Long pause", hint: "900 ms" },
+      { token: "⏸️", label: "Short pause", hint: "400 ms" },
+      { token: "😮‍💨", label: "Breath", hint: "600 ms" },
+    ],
+  },
+  {
+    group: "Tempo",
+    items: [
+      { token: "🐢", label: "Slower", hint: "tempo x0.85" },
+      { token: "🐇", label: "Faster", hint: "tempo x1.15" },
+      { token: "🎙️", label: "Narrator", hint: "reset tempo and plan" },
+    ],
+  },
+  {
+    group: "Acoustics",
+    items: [
+      { token: "📻", label: "Radio", hint: "band-limited radio" },
+      { token: "📱", label: "Phone", hint: "telephone line" },
+      { token: "🏛️", label: "Cathedral", hint: "long reverb" },
+      { token: "🤫", label: "Whisper", hint: "quiet and soft" },
+    ],
+  },
+];
+
 const readPlayerPrefs = () => {
   try {
     const saved = JSON.parse(localStorage.getItem(PLAYER_PREFS_KEY) || "{}");
@@ -303,6 +337,48 @@ export default function TextToSpeech({
   }, [openMenu]);
 
   const toggleMenu = (name) => setOpenMenu((current) => (current === name ? null : name));
+
+  // Insert a direction marker at the caret, with the spacing a reader expects.
+  // Clicking a palette button must not steal focus from the text box, so the
+  // caret is restored on the next frame.
+  const insertDirective = (token) => {
+    const node = textareaRef.current;
+    const current = text || "";
+    // A caret can sit inside an emoji (two UTF-16 units, sometimes joined with
+    // ZWJ). Cutting there would leave half a character behind, so move the
+    // boundary to the nearest safe position.
+    const snap = (index) => {
+      let at = Math.min(Math.max(index, 0), current.length);
+      while (at > 0 && at < current.length) {
+        const previous = current.charCodeAt(at - 1);
+        const next = current.charCodeAt(at);
+        const insideSurrogate = previous >= 0xd800 && previous <= 0xdbff;
+        const afterJoiner = previous === 0x200d;
+        const beforeJoiner = next === 0x200d || next === 0xfe0f || (next >= 0xdc00 && next <= 0xdfff);
+        if (!insideSurrogate && !afterJoiner && !beforeJoiner) break;
+        at -= 1;
+      }
+      return at;
+    };
+    const start = snap(node?.selectionStart ?? current.length);
+    const end = snap(node?.selectionEnd ?? current.length);
+    const before = current.slice(0, start);
+    const after = current.slice(end);
+    const isChapter = token === "📖";
+    const prefix = isChapter
+      ? before && !before.endsWith("\n") ? "\n" : ""
+      : before && !/\s$/.test(before) ? " " : "";
+    const suffix = !after || /^\s/.test(after) ? "" : " ";
+    const insert = `${prefix}${token}${suffix}`;
+    setText(`${before}${insert}${after}`);
+    const caret = before.length + insert.length;
+    requestAnimationFrame(() => {
+      const field = textareaRef.current;
+      if (!field) return;
+      field.focus();
+      field.setSelectionRange(caret, caret);
+    });
+  };
 
   // Clips shown on the page, newest first.
   const clips = useMemo(() => {
@@ -654,16 +730,26 @@ export default function TextToSpeech({
           rows={1}
         />
 
-        {/* Emoji direction only exists for the Polish Piper voices */}
+        {/* Emoji direction only exists for the Polish voices */}
         {String(selectedVoice || "").startsWith("pl_") && (
-          <div className="voice-directive-hint" title="Emoji direction">
-            <span>📖 chapter</span>
-            <span>🛑 900 ms</span>
-            <span>⏸️ 400 ms</span>
-            <span>🐢 slower</span>
-            <span>🐇 faster</span>
-            <span>🎙️ narrator</span>
-            <span>📻 📱 🏛️ 🤫 plan</span>
+          <div className="voice-directive-palette" role="toolbar" aria-label="Emoji direction">
+            {DIRECTIVE_PALETTE.map((group) => (
+              <div className="voice-directive-group" key={group.group}>
+                <span className="voice-directive-group-label">{group.group}</span>
+                {group.items.map((item) => (
+                  <button
+                    type="button"
+                    key={item.token}
+                    className="voice-directive-btn"
+                    onClick={() => insertDirective(item.token)}
+                    title={`${item.label} — ${item.hint}`}
+                    aria-label={`Insert ${item.label}: ${item.hint}`}
+                  >
+                    {item.token}
+                  </button>
+                ))}
+              </div>
+            ))}
           </div>
         )}
 

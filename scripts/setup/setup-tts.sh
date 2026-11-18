@@ -68,6 +68,9 @@ export PATH="$NODE_DIR/bin:$PATH"
 # Kokoro runs on CPU. Avoid ONNX Runtime's optional CUDA payload, which can
 # fail installation when nvcc reports a newer toolkit such as CUDA 13.
 export ONNXRUNTIME_NODE_INSTALL_CUDA=skip
+# Prefer sharp's prebuilt libvips. On rolling distros (Arch) a system libvips
+# makes sharp try a source build, which fails without node-addon-api.
+export SHARP_IGNORE_GLOBAL_LIBVIPS=1
 if [[ -f "$RUNTIME_DIR/package-lock.json" ]]; then
   NPM_INSTALL_MODE="ci"
 else
@@ -82,3 +85,10 @@ else
 fi
 
 print_ok "Kokoro TTS runtime is ready."
+
+# Kokoro only ships English voices; Piper adds other languages (Polish).
+if [[ "$PLATFORM" != "Darwin" ]]; then
+  if ! bash "$SCRIPT_DIR/setup-piper.sh"; then
+    print_warn "Piper voices skipped; English (Kokoro) text-to-speech still works."
+  fi
+fi

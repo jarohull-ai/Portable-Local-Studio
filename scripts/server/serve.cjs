@@ -201,6 +201,94 @@ const TTS_MODEL_CATALOG = [
     recommended: false,
   },
 ];
+// ── Piper voices (extra languages) ───────────────────────────────────────────
+// Kokoro only ships English voices, so other languages run on Piper from an
+// isolated Python runtime (app/tts-runtime/piper-venv, installed by
+// scripts/setup/setup-piper.sh). A piper voice is selected like any other voice.
+const PIPER_RUNTIME = path.join(ROOT, "app", "tts-runtime", "piper-venv");
+const PIPER_BIN = path.join(PIPER_RUNTIME, "bin", process.platform === "win32" ? "piper.exe" : "piper");
+const PIPER_VOICES_DIR = path.join(TTS_MODELS, "piper");
+const PIPER_VOICE_BASE = "https://huggingface.co/rhasspy/piper-voices/resolve/main";
+const PIPER_VOICES = [
+  {
+    id: "pl_gosia",
+    name: "Gosia",
+    language: "pl-pl",
+    gender: "Female",
+    voiceFile: "pl_PL-gosia-medium.onnx",
+    recommended: false,
+  },
+  {
+    id: "pl_darkman",
+    name: "Darkman",
+    language: "pl-pl",
+    gender: "Male",
+    voiceFile: "pl_PL-darkman-medium.onnx",
+    size: "63 MB",
+    recommended: false,
+  },
+  {
+    id: "pl_bass",
+    name: "Bass",
+    language: "pl-pl",
+    gender: "Male",
+    voiceFile: "pl_PL-bass-high.onnx",
+    remotePath: "pl/pl_PL/bass/high",
+    size: "114 MB",
+    recommended: false,
+  },
+  {
+    id: "pl_mc_speech",
+    name: "MC Speech",
+    language: "pl-pl",
+    gender: "",
+    voiceFile: "pl_PL-mc_speech-medium.onnx",
+    remotePath: "pl/pl_PL/mc_speech/medium",
+    size: "63 MB",
+    recommended: false,
+  },
+  {
+    id: "pl_mls_6892",
+    name: "MLS 6892",
+    language: "pl-pl",
+    gender: "",
+    voiceFile: "pl_PL-mls_6892-low.onnx",
+    remotePath: "pl/pl_PL/mls_6892/low",
+    size: "63 MB",
+    recommended: false,
+  },
+];
+
+// Voice conversion: a Polish Piper voice supplies the pronunciation, then
+// OpenVoice V2 repaints the timbre with a reference recording (Kokoro's George).
+const PIPER_PYTHON = path.join(PIPER_RUNTIME, "bin", process.platform === "win32" ? "python.exe" : "python");
+const VC_MODELS = path.join(ROOT, "app", "tts-runtime", "voiceconv");
+const VC_SCRIPT = path.join(ROOT, "scripts", "workers", "tts-voiceconv.py");
+const VC_REFS = path.join(TTS_MODELS, "voiceconv-refs");
+const VOICE_CLONE_VOICES = [
+  {
+    id: "pl_george",
+    name: "George (PL)",
+    language: "pl-pl",
+    gender: "Male",
+    engine: "voiceconv",
+    // A male base keeps the pitch shift small, which leaves the least smear.
+    baseVoice: "pl_darkman",
+    referenceFile: "bm_george.wav",
+    recommended: false,
+  },
+  {
+    id: "pl_george_soft",
+    name: "George (PL) soft",
+    language: "pl-pl",
+    gender: "Male",
+    engine: "voiceconv",
+    baseVoice: "pl_gosia",
+    referenceFile: "bm_george.wav",
+    recommended: false,
+  },
+];
+
 const TTS_VOICES = [
   { id: "af_heart", name: "Heart", language: "en-us", gender: "Female", recommended: true },
   { id: "af_bella", name: "Bella", language: "en-us", gender: "Female", recommended: false },
@@ -210,6 +298,8 @@ const TTS_VOICES = [
   { id: "am_fenrir", name: "Fenrir", language: "en-us", gender: "Male", recommended: false },
   { id: "bf_emma", name: "Emma", language: "en-gb", gender: "Female", recommended: false },
   { id: "bm_george", name: "George", language: "en-gb", gender: "Male", recommended: false },
+  ...PIPER_VOICES.map((voice) => ({ ...voice, engine: "piper" })),
+  ...VOICE_CLONE_VOICES,
 ];
 const OPENVINO_MODELS = path.join(ROOT, "app", "openvino-models");
 if (!fs.existsSync(OPENVINO_MODELS)) {
@@ -2228,8 +2318,85 @@ function readTtsManifest(filename) {
   }
 }
 
-function installTtsCatalogModel(modelIdOrFilename) {
+// Streams a URL to disk, following the redirect Hugging Face sends to its CDN.
+function downloadUrlToFile(url, destPath) {
+  return new Promise((resolve, reject) => {
+    const tmpPath = `${destPath}.part`;
+    const attempt = (target, hops = 0) => {
+      const request = https.get(target, {
+        headers: { "User-Agent": "Portable-Local-Studio/1.0" },
+        timeout: 120000,
+      }, (res) => {
+        const status = res.statusCode || 0;
+        if (status >= 300 && status < 400 && res.headers.location) {
+          res.resume();
+          if (hops >= 5) {
+            reject(new Error(`Too many redirects while downloading ${url}`));
+            return;
+          }
+          attempt(new URL(res.headers.location, target).toString(), hops + 1);
+          return;
+        }
+        if (status !== 200) {
+          res.resume();
+          reject(new Error(`Download failed (HTTP ${status}): ${target}`));
+          return;
+        }
+        const file = fs.createWriteStream(tmpPath);
+        res.pipe(file);
+        file.on("finish", () => {
+          file.close(() => {
+            try {
+              fs.renameSync(tmpPath, destPath);
+              resolve(destPath);
+            } catch (err) {
+              reject(err);
+            }
+          });
+        });
+        file.on("error", (err) => fs.rm(tmpPath, { force: true }, () => reject(err)));
+        res.on("error", (err) => fs.rm(tmpPath, { force: true }, () => reject(err)));
+      });
+      request.on("error", reject);
+      request.on("timeout", () => request.destroy(new Error(`Download timed out: ${target}`)));
+    };
+    attempt(url);
+  });
+}
+
+function getPiperCatalogVoice(value) {
+  const raw = String(value || "").trim()
+    .replace(/^piper:\/\/install\//, "")
+    .replace(/^piper-/, "");
+  return PIPER_VOICES.find((voice) => voice.id === raw || voice.voiceFile === raw) || null;
+}
+
+async function installPiperVoice(modelIdOrFilename) {
+  const voice = getPiperCatalogVoice(modelIdOrFilename);
+  if (!voice) throw new Error(`Unknown Piper voice: ${modelIdOrFilename}`);
+  if (!voice.remotePath) throw new Error(`No download source for the Piper voice: ${voice.id}`);
+  if (!pathInside(PIPER_VOICES_DIR, TTS_MODELS)) throw new Error("Invalid Piper voice directory.");
+  fs.mkdirSync(PIPER_VOICES_DIR, { recursive: true });
+  for (const file of [voice.voiceFile, `${voice.voiceFile}.json`]) {
+    const target = path.join(PIPER_VOICES_DIR, path.basename(file));
+    if (fs.existsSync(target) && fs.statSync(target).size > 0) continue;
+    await downloadUrlToFile(`${PIPER_VOICE_BASE}/${voice.remotePath}/${file}`, target);
+  }
+  const modelPath = path.join(PIPER_VOICES_DIR, voice.voiceFile);
+  return {
+    id: `piper-${voice.id}`,
+    name: `Piper ${voice.name} (PL)`,
+    filename: voice.voiceFile,
+    engine: "piper",
+    installed: true,
+    sizeBytes: getPathSize(modelPath) + getPathSize(`${modelPath}.json`),
+    createdAt: new Date().toISOString(),
+  };
+}
+
+async function installTtsCatalogModel(modelIdOrFilename) {
   const raw = String(modelIdOrFilename || "").trim();
+  if (getPiperCatalogVoice(raw)) return installPiperVoice(raw);
   const catalogModel = TTS_MODEL_CATALOG.find((model) => model.id === raw || model.filename === raw) || TTS_MODEL_CATALOG[0];
   if (!catalogModel) throw new Error("Unknown TTS model.");
   const manifestPath = getTtsManifestPath(catalogModel.filename);
@@ -2283,13 +2450,36 @@ function getTtsModels() {
         };
       });
   } catch (_) {}
-  return [...catalog, ...custom];
+
+  // Piper voices keep their own files (no Kokoro manifest) but belong in the same
+  // catalogue so the Models tab can install and track them.
+  const piperVoices = PIPER_VOICES.map((voice) => {
+    const modelPath = path.join(PIPER_VOICES_DIR, voice.voiceFile);
+    const installed = fs.existsSync(modelPath);
+    const sizeBytes = installed ? getPathSize(modelPath) + getPathSize(`${modelPath}.json`) : 0;
+    return {
+      id: `piper-${voice.id}`,
+      name: `Piper ${voice.name} (PL)`,
+      filename: voice.voiceFile,
+      engine: "piper",
+      format: "Piper ONNX",
+      language: voice.language,
+      size: voice.size || "",
+      sizeBytes,
+      localSize: installed ? formatBytes(sizeBytes) : "",
+      installed,
+      recommended: Boolean(voice.recommended),
+      url: `piper://install/${voice.id}`,
+    };
+  });
+  return [...catalog, ...piperVoices, ...custom];
 }
 
 function resolveTtsModel(value) {
   const raw = String(value || "").trim();
-  const model = getTtsModels().find((item) => item.id === raw || item.filename === raw) ||
-    getTtsModels().find((item) => item.installed);
+  const kokoroModels = getTtsModels().filter((item) => item.engine !== "piper");
+  const model = kokoroModels.find((item) => item.id === raw || item.filename === raw) ||
+    kokoroModels.find((item) => item.installed);
   if (!model) throw new Error("Download or import a Kokoro TTS model from Model Manager first.");
   const manifestPath = getTtsManifestPath(model.filename);
   if (!manifestPath || !fs.existsSync(manifestPath)) {
@@ -2310,6 +2500,114 @@ function getTtsRuntimeStatus() {
   };
 }
 
+function getPiperVoice(value) {
+  const raw = String(value || "").trim();
+  const voice = PIPER_VOICES.find((item) => item.id === raw || item.voiceFile === raw);
+  if (!voice) throw new Error(`Unknown Piper voice: ${raw}`);
+  if (!fs.existsSync(PIPER_BIN)) {
+    throw new Error("The Piper runtime is not installed. Run scripts/setup/setup-piper.sh.");
+  }
+  const modelPath = path.join(PIPER_VOICES_DIR, voice.voiceFile);
+  if (!pathInside(modelPath, PIPER_VOICES_DIR) || !fs.existsSync(modelPath)) {
+    throw new Error(`The Piper voice is not installed: ${voice.voiceFile}. Download it in Models → Voice.`);
+  }
+  return { ...voice, model: modelPath };
+}
+
+function isPiperVoice(value) {
+  const raw = String(value || "").trim();
+  return PIPER_VOICES.some((voice) => voice.id === raw || voice.voiceFile === raw);
+}
+
+function getPiperStatus() {
+  const installedVoices = PIPER_VOICES
+    .filter((voice) => fs.existsSync(path.join(PIPER_VOICES_DIR, voice.voiceFile)))
+    .map((voice) => voice.id);
+  return {
+    installed: fs.existsSync(PIPER_BIN),
+    binary: PIPER_BIN,
+    voicesDir: PIPER_VOICES_DIR,
+    installedVoices,
+  };
+}
+
+function isVoiceCloneVoice(value) {
+  const raw = String(value || "").trim();
+  return VOICE_CLONE_VOICES.some((voice) => voice.id === raw);
+}
+
+function getVoiceCloneVoice(value) {
+  const raw = String(value || "").trim();
+  const voice = VOICE_CLONE_VOICES.find((item) => item.id === raw);
+  if (!voice) throw new Error(`Unknown voice-conversion voice: ${raw}`);
+  if (!fs.existsSync(PIPER_PYTHON)) {
+    throw new Error("The Piper runtime is not installed. Run scripts/setup/setup-piper.sh.");
+  }
+  if (!fs.existsSync(VC_SCRIPT)) {
+    throw new Error("The voice conversion worker is missing (scripts/workers/tts-voiceconv.py).");
+  }
+  for (const file of ["tone_extract.onnx", "tone_color.onnx"]) {
+    if (!fs.existsSync(path.join(VC_MODELS, file))) {
+      throw new Error(`The voice conversion model is missing: ${file}. Run scripts/setup/setup-piper.sh.`);
+    }
+  }
+  const referenceWav = path.join(VC_REFS, voice.referenceFile);
+  if (!pathInside(referenceWav, VC_REFS) || !fs.existsSync(referenceWav)) {
+    throw new Error(`The reference recording for ${voice.name} is missing: ${voice.referenceFile}`);
+  }
+  getPiperVoice(voice.baseVoice);
+  return { ...voice, referenceWav };
+}
+
+function getVoiceCloneStatus() {
+  const modelsInstalled = ["tone_extract.onnx", "tone_color.onnx"]
+    .every((file) => fs.existsSync(path.join(VC_MODELS, file)));
+  return {
+    installed: modelsInstalled && fs.existsSync(PIPER_PYTHON),
+    modelsDir: VC_MODELS,
+    referencesDir: VC_REFS,
+    voices: VOICE_CLONE_VOICES.map((voice) => ({
+      ...voice,
+      installed: modelsInstalled && fs.existsSync(path.join(VC_REFS, voice.referenceFile)),
+    })),
+  };
+}
+
+// Audio length and sample rate straight from the WAV header, so the saved
+// metadata reflects the real audio rather than how long the process ran.
+function readWavInfo(buffer) {
+  try {
+    if (!isWaveBuffer(buffer)) return null;
+    let offset = 12;
+    let fmt = null;
+    let dataSize = 0;
+    while (offset + 8 <= buffer.length) {
+      const id = buffer.toString("ascii", offset, offset + 4);
+      const size = buffer.readUInt32LE(offset + 4);
+      const start = offset + 8;
+      if (start + size > buffer.length) break;
+      if (id === "fmt ") {
+        fmt = {
+          channels: buffer.readUInt16LE(start + 2),
+          sampleRate: buffer.readUInt32LE(start + 4),
+          bitsPerSample: buffer.readUInt16LE(start + 14),
+        };
+      } else if (id === "data") {
+        dataSize = size;
+      }
+      offset = start + size + (size % 2);
+    }
+    if (!fmt || !dataSize) return null;
+    const bytesPerSecond = fmt.sampleRate * fmt.channels * (fmt.bitsPerSample / 8);
+    return {
+      sampleRate: fmt.sampleRate,
+      durationMs: bytesPerSecond ? Math.round((dataSize / bytesPerSecond) * 1000) : 0,
+    };
+  } catch (_) {
+    return null;
+  }
+}
+
 function runExclusiveTtsOperation(operation) {
   const run = ttsOperationQueue.catch(() => {}).then(operation);
   ttsOperationQueue = run.catch(() => {});
@@ -2317,6 +2615,37 @@ function runExclusiveTtsOperation(operation) {
 }
 
 async function startTts(settings = {}) {
+  const requestedVoice = String(settings.voice || ttsSettings.voice || "af_heart");
+  if (isVoiceCloneVoice(requestedVoice)) {
+    const voice = getVoiceCloneVoice(requestedVoice);
+    PORT_TTS = PREFERRED_TTS_PORT;
+    ttsError = null;
+    ttsReady = true;
+    ttsSettings = {
+      ...ttsSettings,
+      model: null,
+      voice: voice.id,
+      speed: Math.max(0.5, Math.min(2, Number(settings.speed) || ttsSettings.speed || 1)),
+      dtype: "onnx",
+      backendMode: "Piper + OpenVoice",
+    };
+    return;
+  }
+  if (isPiperVoice(requestedVoice)) {
+    const voice = getPiperVoice(requestedVoice);
+    PORT_TTS = PREFERRED_TTS_PORT;
+    ttsError = null;
+    ttsReady = true;
+    ttsSettings = {
+      ...ttsSettings,
+      model: null,
+      voice: voice.id,
+      speed: Math.max(0.5, Math.min(2, Number(settings.speed) || ttsSettings.speed || 1)),
+      dtype: "onnx",
+      backendMode: "Piper",
+    };
+    return;
+  }
   const runtime = getTtsRuntimeStatus();
   if (!runtime.installed) {
     throw new Error("Kokoro TTS runtime is not installed. Run scripts/setup/setup-tts for this platform.");
@@ -2490,6 +2819,15 @@ function synthesizeTts(text, options = {}) {
       reject(new Error("TTS text is too long. Limit is 5000 characters for V1."));
       return;
     }
+    const requestedVoice = String(options.voice || ttsSettings.voice || "af_heart");
+    if (isVoiceCloneVoice(requestedVoice)) {
+      synthesizeVoiceCloneTts(cleanedText, { ...options, voice: requestedVoice }).then(resolve, reject);
+      return;
+    }
+    if (isPiperVoice(requestedVoice)) {
+      synthesizePiperTts(cleanedText, { ...options, voice: requestedVoice }).then(resolve, reject);
+      return;
+    }
     const runtime = getTtsRuntimeStatus();
     if (!runtime.installed) {
       reject(new Error("Kokoro TTS runtime is not installed."));
@@ -2607,6 +2945,179 @@ function synthesizeTts(text, options = {}) {
     });
     proc.stdin.end(JSON.stringify(payload));
   });
+}
+
+// Piper's length_scale is the inverse of a speed multiplier.
+function runPiperToWav(voice, text, speed, outPath) {
+  return new Promise((resolve, reject) => {
+    const args = [
+      "-m", voice.model,
+      "-f", outPath,
+      "--length-scale", String(Number((1 / speed).toFixed(3))),
+    ];
+    const proc = spawn(PIPER_BIN, args, { cwd: ROOT, stdio: "pipe", windowsHide: true });
+    let stderr = "";
+    proc.stdout.on("data", () => {});
+    proc.stderr.on("data", (data) => { stderr += data.toString(); });
+    proc.stdin.on("error", () => {});
+    proc.on("error", reject);
+    proc.on("exit", (code) => {
+      if (code !== 0) {
+        reject(new Error((stderr || `Piper exited with code ${code}`).trim().slice(-1400)));
+        return;
+      }
+      if (!fs.existsSync(outPath)) {
+        reject(new Error("Piper did not produce a WAV file."));
+        return;
+      }
+      resolve(outPath);
+    });
+    proc.stdin.end(`${text}\n`);
+  });
+}
+
+function runVoiceConversion({ sourceWav, referenceWav, outPath, tau = 0.3 }) {
+  return new Promise((resolve, reject) => {
+    const args = [VC_SCRIPT, "--src", sourceWav, "--ref", referenceWav, "--out", outPath, "--models", VC_MODELS, "--tau", String(tau), "--clean"];
+    const proc = spawn(PIPER_PYTHON, args, {
+      cwd: ROOT,
+      stdio: "pipe",
+      windowsHide: true,
+      env: { ...process.env, OMP_NUM_THREADS: String(Math.min(8, (os.cpus() || []).length || 4)) },
+    });
+    let stderr = "";
+    proc.stdout.on("data", () => {});
+    proc.stderr.on("data", (data) => { stderr += data.toString(); });
+    proc.on("error", reject);
+    proc.on("exit", (code) => {
+      if (code !== 0 || !fs.existsSync(outPath)) {
+        reject(new Error((stderr || `Voice conversion exited with code ${code}`).trim().slice(-1400)));
+        return;
+      }
+      resolve(outPath);
+    });
+  });
+}
+
+function saveSynthesizedWav({ text, wavPath, voiceId, voiceName, modelFile, modelName, speed, startedAt }) {
+  const info = readWavInfo(fs.readFileSync(wavPath));
+  return saveTtsOutput({
+    text,
+    model: modelFile,
+    modelName,
+    voice: voiceId,
+    voiceName,
+    speed,
+    durationMs: info?.durationMs || Date.now() - startedAt,
+    sampleRate: info?.sampleRate || 22050,
+    wavPath,
+    displayName: `${voiceName} - ${text.slice(0, 40)}`,
+  });
+}
+
+function synthesizePiperTts(text, options = {}) {
+  let voice;
+  try {
+    voice = getPiperVoice(options.voice);
+  } catch (err) {
+    return Promise.reject(err);
+  }
+  const speed = Math.max(0.5, Math.min(2, Number(options.speed) || ttsSettings.speed || 1));
+  const stamp = new Date().toISOString().replace(/[:.]/g, "-");
+  const tempWav = path.join(TTS_OUTPUTS, `.tts-piper-${stamp}.wav`);
+  const startedAt = Date.now();
+  ttsGenerationState = {
+    active: true,
+    phase: "Generating speech",
+    progress: -1,
+    done: 0,
+    total: 0,
+    startedAt,
+    model: voice.voiceFile,
+    voice: voice.id,
+    output: "",
+  };
+  return runPiperToWav(voice, text, speed, tempWav)
+    .then(() => {
+      const saved = saveSynthesizedWav({
+        text,
+        wavPath: tempWav,
+        voiceId: voice.id,
+        voiceName: voice.name,
+        modelFile: voice.voiceFile,
+        modelName: `Piper ${voice.name}`,
+        speed,
+        startedAt,
+      });
+      try { fs.unlinkSync(tempWav); } catch (_) {}
+      ttsGenerationState = { active: false, phase: "Complete", progress: 100, model: voice.voiceFile, voice: voice.id, output: saved.audioFile || "" };
+      ttsError = null;
+      return saved;
+    })
+    .catch((err) => {
+      try { fs.unlinkSync(tempWav); } catch (_) {}
+      ttsGenerationState = { active: false, phase: "Failed", progress: 0, model: voice.voiceFile, voice: voice.id, output: "" };
+      ttsError = err.message || String(err);
+      throw err;
+    });
+}
+
+// George (PL): Polish pronunciation from Piper, then George's timbre from OpenVoice.
+function synthesizeVoiceCloneTts(text, options = {}) {
+  let voice;
+  try {
+    voice = getVoiceCloneVoice(options.voice);
+  } catch (err) {
+    return Promise.reject(err);
+  }
+  const base = getPiperVoice(voice.baseVoice);
+  const speed = Math.max(0.5, Math.min(2, Number(options.speed) || ttsSettings.speed || 1));
+  const stamp = new Date().toISOString().replace(/[:.]/g, "-");
+  const baseWav = path.join(TTS_OUTPUTS, `.tts-vc-base-${stamp}.wav`);
+  const outWav = path.join(TTS_OUTPUTS, `.tts-vc-${stamp}.wav`);
+  const startedAt = Date.now();
+  ttsGenerationState = {
+    active: true,
+    phase: "Generating speech",
+    progress: -1,
+    done: 0,
+    total: 0,
+    startedAt,
+    model: voice.referenceFile,
+    voice: voice.id,
+    output: "",
+  };
+  const cleanup = () => {
+    try { fs.unlinkSync(baseWav); } catch (_) {}
+    try { fs.unlinkSync(outWav); } catch (_) {}
+  };
+  return runPiperToWav(base, text, speed, baseWav)
+    .then(() => {
+      ttsGenerationState = { ...ttsGenerationState, phase: "Converting voice colour" };
+      return runVoiceConversion({ sourceWav: baseWav, referenceWav: voice.referenceWav, outPath: outWav });
+    })
+    .then(() => {
+      const saved = saveSynthesizedWav({
+        text,
+        wavPath: outWav,
+        voiceId: voice.id,
+        voiceName: voice.name,
+        modelFile: voice.referenceFile,
+        modelName: `Piper ${base.name} + OpenVoice (${voice.name})`,
+        speed,
+        startedAt,
+      });
+      cleanup();
+      ttsGenerationState = { active: false, phase: "Complete", progress: 100, model: voice.referenceFile, voice: voice.id, output: saved.audioFile || "" };
+      ttsError = null;
+      return saved;
+    })
+    .catch((err) => {
+      cleanup();
+      ttsGenerationState = { active: false, phase: "Failed", progress: 0, model: voice.referenceFile, voice: voice.id, output: "" };
+      ttsError = err.message || String(err);
+      throw err;
+    });
 }
 
 function runExclusiveSpeechOperation(operation) {
@@ -6498,6 +7009,8 @@ const server = http.createServer(async (req, res) => {
       settings: ttsSettings,
       generation: ttsGenerationState,
       voices: TTS_VOICES,
+      piper: getPiperStatus(),
+      voiceConversion: getVoiceCloneStatus(),
     });
   }
 
@@ -6541,7 +7054,7 @@ const server = http.createServer(async (req, res) => {
     const body = await readJsonBody(req, res);
     if (!body) return;
     try {
-      const model = installTtsCatalogModel(body.modelId || body.model_id || body.model || body.filename);
+      const model = await installTtsCatalogModel(body.modelId || body.model_id || body.model || body.filename);
       return json(res, 200, { ok: true, message: "TTS model manifest installed", filename: model.filename, model });
     } catch (err) {
       return json(res, 500, { ok: false, error: err.message || String(err) });

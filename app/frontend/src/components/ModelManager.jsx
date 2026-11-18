@@ -326,6 +326,50 @@ const TTS_MODEL_LIBRARY = [
       },
     ],
   },
+  {
+    group: "Piper voices (Polish, offline)",
+    items: [
+      {
+        id: "pl_bass",
+        name: "Piper Bass (PL)",
+        filename: "pl_PL-bass-high.onnx",
+        engine: "piper",
+        format: "Piper ONNX",
+        approxSize: "114 MB",
+        resolution: "22 kHz WAV",
+        notes: "Polish male lector voice, high quality (Apache-2.0). Different timbre from Darkman.",
+        url: "piper://install/pl_bass",
+        pageUrl: "https://huggingface.co/rhasspy/piper-voices/tree/main/pl/pl_PL/bass",
+        recommendedTiers: ["Low", "Mid", "High"],
+      },
+      {
+        id: "pl_mc_speech",
+        name: "Piper MC Speech (PL)",
+        filename: "pl_PL-mc_speech-medium.onnx",
+        engine: "piper",
+        format: "Piper ONNX",
+        approxSize: "63 MB",
+        resolution: "22 kHz WAV",
+        notes: "Polish single-speaker voice from the CC0 MC Speech dataset. Medium quality, quick to run.",
+        url: "piper://install/pl_mc_speech",
+        pageUrl: "https://huggingface.co/rhasspy/piper-voices/tree/main/pl/pl_PL/mc_speech",
+        recommendedTiers: ["Low", "Mid", "High"],
+      },
+      {
+        id: "pl_mls_6892",
+        name: "Piper MLS 6892 (PL)",
+        filename: "pl_PL-mls_6892-low.onnx",
+        engine: "piper",
+        format: "Piper ONNX",
+        approxSize: "63 MB",
+        resolution: "16 kHz WAV",
+        notes: "Polish single-speaker voice from the MLS dataset (CC BY 4.0). Lowest quality, fastest of the set.",
+        url: "piper://install/pl_mls_6892",
+        pageUrl: "https://huggingface.co/rhasspy/piper-voices/tree/main/pl/pl_PL/mls_6892",
+        recommendedTiers: ["Low", "Mid"],
+      },
+    ],
+  },
 ];
 
 const COREML_MODEL_LIBRARY = [
@@ -451,9 +495,11 @@ function ModelManager({
     ? localModels.filter((model) => model.filename)
     : localModels.map(normalizeModel).filter((model) => model.filename);
   const displayedLocalModels = activeModelType === "speech" || activeModelType === "tts"
-    ? normalizedLocalModels.filter((model) => model.installed)
+    ? normalizedLocalModels.filter((model) => model.installed && !(activeModelType === "tts" && model.engine === "piper"))
     : normalizedLocalModels.filter((model) => !model.isProjector);
-  const allModelNames = activeModelType === "speech" || activeModelType === "tts"
+  const allModelNames = activeModelType === "tts"
+    ? normalizedLocalModels.filter((model) => model.installed).map((model) => model.filename)
+    : activeModelType === "speech"
     ? displayedLocalModels.map((model) => model.filename)
     : normalizedLocalModels.map((model) => model.filename);
   const modelNames = displayedLocalModels.map((model) => model.filename);
@@ -823,10 +869,13 @@ function ModelManager({
     }
 
     if (activeModelType === "tts") {
+      const isPiperVoice = model.engine === "piper";
       const confirmed = await showConfirm({
-        title: "Download TTS Model?",
-        message: `Install "${model.name}"? Kokoro model files are cached on first generation.`,
-        confirmLabel: "Install",
+        title: isPiperVoice ? "Download Piper Voice?" : "Download TTS Model?",
+        message: isPiperVoice
+          ? `Download "${model.name}" (${model.size || model.approxSize})? It is stored in app/tts-models/piper and shows up in the Voice tab.`
+          : `Install "${model.name}"? Kokoro model files are cached on first generation.`,
+        confirmLabel: isPiperVoice ? "Download" : "Install",
       });
       if (confirmed) {
         await downloadByUrl(model.id || model.url, model.filename);

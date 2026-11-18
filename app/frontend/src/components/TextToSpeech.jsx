@@ -225,7 +225,8 @@ export default function TextToSpeech({
   const voiceMenuRef = useRef(null);
   const speedMenuRef = useRef(null);
 
-  const installedModels = useMemo(() => models.filter((model) => model.installed), [models]);
+  // Piper voices are picked as voices, not as Kokoro model files.
+  const installedModels = useMemo(() => models.filter((model) => model.installed && model.engine !== "piper"), [models]);
   const voices = status.voices?.length ? status.voices : FALLBACK_VOICES;
   const selectedVoice = ttsSettings?.voice || "af_heart";
   const speed = ttsSettings?.speed || 1;

@@ -15,6 +15,7 @@ const { detectModelKindCached } = require("./model-kind.cjs");
 const {
   applyDspPreset,
   hasDirectives,
+  hasSpeakableText,
   joinSegments,
   parseDirectedText,
   pcm16FromWav,
@@ -2840,7 +2841,11 @@ function synthesizeTts(text, options = {}) {
         synthesizeDirectedTts(cleanedText, { ...options, voice: requestedVoice }).then(resolve, reject);
         return;
       }
-      const prepared = preparePlainText(cleanedText, { polish: true }) || cleanedText;
+      const prepared = preparePlainText(cleanedText, { polish: true });
+      if (!prepared) {
+        reject(new Error("There is nothing to read aloud - the text has no words."));
+        return;
+      }
       if (isVoiceCloneVoice(requestedVoice)) {
         synthesizeVoiceCloneTts(prepared, { ...options, voice: requestedVoice }).then(resolve, reject);
         return;
@@ -2973,6 +2978,11 @@ function synthesizeTts(text, options = {}) {
 
 // Piper's length_scale is the inverse of a speed multiplier.
 function runPiperToWav(voice, text, speed, outPath) {
+  // Piper writes its WAV header only after the first audio chunk, so text it has
+  // no phonemes for (punctuation, leftover symbols) fails with a raw wave traceback.
+  if (!hasSpeakableText(text)) {
+    return Promise.reject(new Error("There is nothing to read aloud - the text has no words."));
+  }
   return new Promise((resolve, reject) => {
     const args = [
       "-m", voice.model,
@@ -2987,7 +2997,10 @@ function runPiperToWav(voice, text, speed, outPath) {
     proc.on("error", reject);
     proc.on("exit", (code) => {
       if (code !== 0) {
-        reject(new Error((stderr || `Piper exited with code ${code}`).trim().slice(-1400)));
+        const message = stderr.includes("# channels not specified")
+          ? "Piper produced no audio for this text (no words to read)."
+          : (stderr || `Piper exited with code ${code}`).trim().slice(-1400);
+        reject(new Error(message));
         return;
       }
       if (!fs.existsSync(outPath)) {

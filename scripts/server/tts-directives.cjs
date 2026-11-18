@@ -193,6 +193,10 @@ function round2(value) {
   return Math.round(value * 100) / 100;
 }
 
+function hasSpeakableText(value) {
+  return /[\p{L}\p{N}]/u.test(String(value || ""));
+}
+
 function cleanupChunk(value, options = {}) {
   let text = String(value || "")
     .replace(DIRECTIVE_PATTERN, " ")
@@ -201,7 +205,11 @@ function cleanupChunk(value, options = {}) {
     .trim();
   if (!text) return "";
   if (options.polish) text = verbalizePolish(text);
-  return text.replace(/\s+/g, " ").trim();
+  text = text.replace(/\s+/g, " ").trim();
+  // Punctuation alone ("...", "—") has no phonemes to synthesize: the engine
+  // would write an empty WAV and fail, so such a chunk is treated as no text.
+  if (!hasSpeakableText(text)) return "";
+  return text;
 }
 
 // Text without any direction, still normalised: used by the plain (non-directed)
@@ -619,6 +627,7 @@ module.exports = {
   applyDspPreset,
   describeDirectives,
   hasDirectives,
+  hasSpeakableText,
   joinSegments,
   parseDirectedText,
   parseWav,
